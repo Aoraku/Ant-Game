@@ -672,7 +672,7 @@ class GameInfo:
 
     @staticmethod
     def upgrade_tower_cost(tower_type: int) -> int:
-        if tower_type in (TowerType.HEAVY, TowerType.QUICK, TowerType.MORTAR):
+        if tower_type in (TowerType.HEAVY, TowerType.QUICK, TowerType.MORTAR, TowerType.PRODUCER):
             return 60
         if tower_type in (
             TowerType.HEAVY_PLUS,
@@ -684,6 +684,9 @@ class GameInfo:
             TowerType.MORTAR_PLUS,
             TowerType.PULSE,
             TowerType.MISSILE,
+            TowerType.PRODUCER_FAST,
+            TowerType.PRODUCER_SIEGE,
+            TowerType.PRODUCER_MEDIC,
         ):
             return 200
         return -1

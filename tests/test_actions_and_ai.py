@@ -587,6 +587,60 @@ def test_greedy_ai_smoke_uses_sdk_runtime_view_without_re() -> None:
         accepted.append(sdk_operation)
 
 
+def test_greedy_ai_saves_for_lightning_storm_when_not_ready() -> None:
+    info = ForecastState(43)
+    info.coins[0] = 75
+    info.ants.append(ForecastAnt(0, 1, 9, 9, 20, 0, 0, ForecastAntState.ALIVE))
+
+    assert GreedyAI()(0, info) == []
+
+
+def test_greedy_ai_uses_lightning_storm_on_densest_enemy_cluster() -> None:
+    info = ForecastState(44)
+    info.coins[0] = 90
+    clustered = [
+        ForecastAnt(0, 1, 9, 9, 20, 0, 0, ForecastAntState.ALIVE),
+        ForecastAnt(1, 1, 10, 9, 20, 0, 0, ForecastAntState.ALIVE),
+        ForecastAnt(2, 1, 9, 10, 20, 0, 0, ForecastAntState.ALIVE),
+    ]
+    info.ants.extend([*clustered, ForecastAnt(3, 1, 2, 2, 20, 0, 0, ForecastAntState.ALIVE)])
+
+    operations = GreedyAI()(0, info)
+
+    assert len(operations) == 1
+    storm = operations[0]
+    assert storm.type == OperationType.USE_LIGHTNING_STORM
+    assert all(greedy_module._load_impl("ai").distance(storm.arg0, storm.arg1, ant.x, ant.y) <= 3 for ant in clustered)
+
+
+def test_greedy_ai_upgrades_basic_tower_to_producer_only_when_storm_reserve_survives() -> None:
+    info = ForecastState(45)
+    info.round = 0
+    info.coins[0] = 100
+    info.super_weapon_cd[0][int(SuperWeaponType.LIGHTNING_STORM)] = 35
+    info.build_tower(0, 0, 6, 9, TowerType.BASIC)
+
+    operations = GreedyAI()(0, info)
+
+    assert operations == [ForecastOperation(OperationType.UPGRADE_TOWER, 0, int(TowerType.PRODUCER))]
+
+    info.coins[0] = 68
+    assert GreedyAI()(0, info) == []
+
+
+def test_greedy_ai_builds_during_storm_cooldown_without_spending_reserve() -> None:
+    info = ForecastState(46)
+    info.round = 0
+    info.coins[0] = 54
+    info.super_weapon_cd[0][int(SuperWeaponType.LIGHTNING_STORM)] = 35
+
+    operations = GreedyAI()(0, info)
+
+    assert len(operations) == 1
+    assert operations[0].type == OperationType.BUILD_TOWER
+    assert info.coins[0] + info.get_operation_income(0, operations[0]) == 39
+
+
 def test_greedy_rollout_pheromone_update_tolerates_teleported_ant_trails() -> None:
     info = ForecastState(19)
     info.ants.append(
