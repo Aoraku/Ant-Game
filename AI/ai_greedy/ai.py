@@ -52,6 +52,19 @@ DEFLECTOR_COST = SUPER_WEAPON_STATS[SuperWeaponType.DEFLECTOR].cost
 EVASION_COST = SUPER_WEAPON_STATS[SuperWeaponType.EMERGENCY_EVASION].cost
 LIGHTNING_STORM_COST = SUPER_WEAPON_STATS[SuperWeaponType.LIGHTNING_STORM].cost
 LIGHTNING_STORM_RANGE = SUPER_WEAPON_STATS[SuperWeaponType.LIGHTNING_STORM].attack_range
+STORM_READY_RESERVE = 85
+TARGET_PRODUCER_COUNT = 2
+ENDGAME_HP_THRESHOLD = 10
+SURPLUS_EVASION_BUFFER = 20
+STORM_ANT_WEIGHT = 13.5
+STORM_TOWER_WEIGHT = 8.0
+STORM_HOME_THREAT_WEIGHT = 2.8
+STORM_FORWARD_WEIGHT = 0.25
+BUILD_PRESSURE_WEIGHT = 8.0
+BUILD_HEAT_WEIGHT = 10.0
+BUILD_FORWARD_WEIGHT = 0.45
+BUILD_HOME_SAFETY_WEIGHT = 0.12
+UNSAFE_SITE_COOLDOWN = 30
 EMP_BUFFER_CAP = max(EMP_COST - 1, 0)
 LEVEL2_BASE_UPGRADE_COST, LEVEL3_BASE_UPGRADE_COST = BASE_UPGRADE_COST
 LEVEL2_TOWER_TOTAL_COST = LEVEL2_TOWER_UPGRADE_COST
@@ -553,6 +566,8 @@ class AI:
         self.last_superweapon_round = -1
         self.reserve_depth = 0
         self.nodes: List[ForecastNode] = []
+        self.enemy_trail_heat: dict[Tuple[int, int], float] = {}
+        self.unsafe_until_round: dict[Tuple[int, int], int] = {}
 
     def create_session(self):
         return _load_runtime_module().GreedySession(self)
@@ -570,6 +585,124 @@ class AI:
     def _tower_by_id(self, tower_id: int, info: GameInfo) -> Optional[Tower]:
         return info.tower_of_id(tower_id)
 
+    def _producer_count(self, info: GameInfo) -> int:
+        return sum(
+            1
+            for tower in info.towers
+            if tower.player == self.side
+            and tower.type
+            in (
+                TowerType.PRODUCER,
+                TowerType.PRODUCER_FAST,
+                TowerType.PRODUCER_SIEGE,
+                TowerType.PRODUCER_MEDIC,
+            )
+        )
+
+    def _producer_pipeline_count(self, info: GameInfo) -> int:
+        count = self._producer_count(info)
+        count += sum(
+            1
+            for tower in info.towers
+            if tower.player == self.side and tower.type == TowerType.BASIC
+        )
+        return count
+
+    def _producer_budget_gap(self, info: GameInfo) -> int:
+        missing = TARGET_PRODUCER_COUNT - self._producer_count(info)
+        if missing <= 0:
+            return 0
+        upgradeable_basics = sum(
+            1
+            for tower in info.towers
+            if tower.player == self.side
+            and tower.type == TowerType.BASIC
+            and not info.tower_under_emp(tower)
+            and not self._is_enemy_adjacent(info, tower.x, tower.y)
+        )
+        tower_count = info.tower_num_of_player(self.side)
+        budget = 0
+        upgrades = min(missing, upgradeable_basics)
+        budget += upgrades * LEVEL2_TOWER_UPGRADE_COST
+        missing -= upgrades
+        for _ in range(missing):
+            budget += info.build_tower_cost(tower_count) + LEVEL2_TOWER_UPGRADE_COST
+            tower_count += 1
+        return budget
+
+    def _refresh_enemy_trail_heat(self, info: GameInfo) -> None:
+        if len(self.enemy_trail_heat) > 400:
+            self.enemy_trail_heat = {
+                cell: heat
+                for cell, heat in self.enemy_trail_heat.items()
+                if heat >= 0.15
+            }
+        for cell in list(self.enemy_trail_heat):
+            faded = self.enemy_trail_heat[cell] * 0.92
+            if faded < 0.05:
+                del self.enemy_trail_heat[cell]
+            else:
+                self.enemy_trail_heat[cell] = faded
+        for ant in info.ants:
+            if ant.player != 1 - self.side or not ant.is_alive():
+                continue
+            self.enemy_trail_heat[(ant.x, ant.y)] = self.enemy_trail_heat.get((ant.x, ant.y), 0.0) + 1.0
+            for cell in ant.trail_cells[-4:]:
+                self.enemy_trail_heat[cell] = self.enemy_trail_heat.get(cell, 0.0) + 0.18
+        for cell, until_round in list(self.unsafe_until_round.items()):
+            if until_round <= info.round:
+                del self.unsafe_until_round[cell]
+
+    def _enemy_heat_near(self, x: int, y: int, radius: int = 2) -> float:
+        heat = 0.0
+        for (hx, hy), value in self.enemy_trail_heat.items():
+            gap = distance(x, y, hx, hy)
+            if gap <= radius:
+                heat += value / (gap + 1)
+        return heat
+
+    def _is_enemy_adjacent(self, info: GameInfo, x: int, y: int) -> bool:
+        return any(
+            ant.player == 1 - self.side
+            and ant.is_alive()
+            and distance(x, y, ant.x, ant.y) <= 1
+            for ant in info.ants
+        )
+
+    def _try_remove_threatened_producer(self, info: GameInfo) -> List[Operation]:
+        candidates: List[Tuple[int, int, Operation]] = []
+        for tower in info.towers:
+            if tower.player != self.side or info.tower_under_emp(tower):
+                continue
+            if tower.type == TowerType.BASIC:
+                if self._is_enemy_adjacent(info, tower.x, tower.y):
+                    op = Operation(OperationType.DOWNGRADE_TOWER, tower.id)
+                    if info.is_operation_sequence_valid(self.side, [], op):
+                        home = info.bases[self.side]
+                        candidates.append((distance(tower.x, tower.y, home.x, home.y), tower.id, op))
+                continue
+            if tower.type not in (
+                TowerType.PRODUCER,
+                TowerType.PRODUCER_FAST,
+                TowerType.PRODUCER_SIEGE,
+                TowerType.PRODUCER_MEDIC,
+            ):
+                continue
+            if not self._is_enemy_adjacent(info, tower.x, tower.y):
+                continue
+            op = Operation(OperationType.DOWNGRADE_TOWER, tower.id)
+            if info.is_operation_sequence_valid(self.side, [], op):
+                home = info.bases[self.side]
+                candidates.append((distance(tower.x, tower.y, home.x, home.y), tower.id, op))
+        if not candidates:
+            return []
+        chosen = min(candidates, key=lambda item: (item[0], item[1]))
+        op = chosen[2]
+        tower = info.tower_of_id(op.arg0)
+        if tower is not None:
+            self.unsafe_until_round[(tower.x, tower.y)] = info.round + UNSAFE_SITE_COOLDOWN
+        return [op]
+
     def _future_basic_income_until_storm_ready(self, info: GameInfo) -> int:
         cd = info.super_weapon_cd[self.side][int(SuperWeaponType.LIGHTNING_STORM)]
         income = 0
@@ -581,11 +714,13 @@ class AI:
     def _storm_reserve(self, info: GameInfo) -> int:
         cd = info.super_weapon_cd[self.side][int(SuperWeaponType.LIGHTNING_STORM)]
         if cd <= 0:
-            return LIGHTNING_STORM_COST
-        return max(0, LIGHTNING_STORM_COST - self._future_basic_income_until_storm_ready(info))
+            return STORM_READY_RESERVE
+        return max(0, STORM_READY_RESERVE - self._future_basic_income_until_storm_ready(info))
 
     def _storm_density_at(self, info: GameInfo, x: int, y: int) -> float:
         enemy = 1 - self.side
+        my_base = info.bases[self.side]
+        enemy_base = info.bases[enemy]
         value = 0.0
         for ant in info.ants:
             if ant.player != enemy or not ant.is_alive():
@@ -594,9 +729,19 @@ class AI:
             if gap > LIGHTNING_STORM_RANGE:
                 continue
             kind_bonus = 1.2 if ant.kind == AntKind.COMBAT else 1.0
-            value += kind_bonus * (1.0 + max(0, LIGHTNING_STORM_RANGE - gap) * 0.08)
+            home_threat = max(0, 9 - distance(ant.x, ant.y, my_base.x, my_base.y))
+            value += STORM_ANT_WEIGHT * kind_bonus * (1.0 + max(0, LIGHTNING_STORM_RANGE - gap) * 0.08)
+            value += STORM_HOME_THREAT_WEIGHT * home_threat
             if ant.hp <= LIGHTNING_STORM_ANT_DAMAGE:
                 value += ant.reward() * 0.03
+        for tower in info.towers:
+            if tower.player != enemy:
+                continue
+            gap = distance(x, y, tower.x, tower.y)
+            if gap <= LIGHTNING_STORM_RANGE:
+                tower_level = 0 if tower.type == TowerType.BASIC else (1 if int(tower.type) < 10 else 2)
+                value += STORM_TOWER_WEIGHT * (1.0 + tower_level * 0.6) * (1.0 + max(0, LIGHTNING_STORM_RANGE - gap) * 0.12)
+        value += max(0, 18 - distance(x, y, enemy_base.x, enemy_base.y)) * STORM_FORWARD_WEIGHT
         return value
 
     def _best_lightning_storm_point(self, info: GameInfo) -> Tuple[int, int]:
@@ -623,6 +768,24 @@ class AI:
                 pressure += (7 - gap) * (1.25 if ant.kind == AntKind.COMBAT else 1.0)
         return pressure
 
+    def _build_site_score(self, info: GameInfo, x: int, y: int) -> float:
+        my_base = info.bases[self.side]
+        enemy_base = info.bases[1 - self.side]
+        direct_danger = 999.0 if self._is_enemy_adjacent(info, x, y) else 0.0
+        recent_danger = 300.0 if self.unsafe_until_round.get((x, y), -1) > info.round else 0.0
+        pressure = self._enemy_pressure_at(info, x, y)
+        heat = self._enemy_heat_near(x, y)
+        forward = distance(x, y, enemy_base.x, enemy_base.y)
+        home_gap = distance(x, y, my_base.x, my_base.y)
+        return (
+            direct_danger
+            + recent_danger
+            + pressure * BUILD_PRESSURE_WEIGHT
+            + heat * BUILD_HEAT_WEIGHT
+            + forward * BUILD_FORWARD_WEIGHT
+            - home_gap * BUILD_HOME_SAFETY_WEIGHT
+        )
+
     def _can_keep_storm_reserve(self, info: GameInfo, ops: Sequence[Operation], reserve: int) -> bool:
         coins = info.coins[self.side]
         towers = info.tower_num_of_player(self.side)
@@ -643,11 +806,22 @@ class AI:
                 coins += info.get_operation_income(self.side, op)
         return coins >= reserve
 
-    def _try_build_or_upgrade_producer(self, info: GameInfo) -> List[Operation]:
-        if info.super_weapon_cd[self.side][int(SuperWeaponType.LIGHTNING_STORM)] <= 0:
+    def _try_build_or_upgrade_producer(
+        self,
+        info: GameInfo,
+        *,
+        allow_when_storm_ready: bool = False,
+        reserve_override: int | None = None,
+    ) -> List[Operation]:
+        if (
+            not allow_when_storm_ready
+            and info.super_weapon_cd[self.side][int(SuperWeaponType.LIGHTNING_STORM)] <= 0
+        ):
+            return []
+        if self._producer_count(info) >= TARGET_PRODUCER_COUNT:
             return []
 
-        reserve = self._storm_reserve(info)
+        reserve = self._storm_reserve(info) if reserve_override is None else reserve_override
 
         upgrade_candidates: List[Tuple[float, Operation]] = []
         for tower in info.towers:
@@ -658,9 +832,14 @@ class AI:
                 continue
             if not self._can_keep_storm_reserve(info, [op], reserve):
                 continue
-            upgrade_candidates.append((self._enemy_pressure_at(info, tower.x, tower.y), op))
+            if self._is_enemy_adjacent(info, tower.x, tower.y):
+                continue
+            upgrade_candidates.append((self._build_site_score(info, tower.x, tower.y), op))
         if upgrade_candidates:
             return [min(upgrade_candidates, key=lambda item: item[0])[1]]
+
+        if self._producer_pipeline_count(info) >= TARGET_PRODUCER_COUNT:
+            return []
 
         build_candidates: List[Tuple[float, int, Operation]] = []
         towers = info.tower_num_of_player(self.side)
@@ -671,13 +850,77 @@ class AI:
                 continue
             if not self._can_keep_storm_reserve(info, [op], reserve):
                 continue
-            pressure = self._enemy_pressure_at(info, x, y)
-            build_candidates.append((pressure, info.build_tower_cost(towers), op))
+            score = self._build_site_score(info, x, y)
+            build_candidates.append((score, info.build_tower_cost(towers), op))
         if build_candidates:
             return [min(build_candidates, key=lambda item: (item[0], item[1]))[2]]
         return []
 
+    def _try_use_evasion(self, info: GameInfo) -> List[Operation]:
+        if info.round < 180:
+            return []
+        if info.super_weapon_cd[self.side][int(SuperWeaponType.EMERGENCY_EVASION)] > 0:
+            return []
+        if info.super_weapon_cd[self.side][int(SuperWeaponType.LIGHTNING_STORM)] <= 0:
+            return []
+        reserve = self._storm_reserve(info)
+        producer_budget = self._producer_budget_gap(info)
+        if info.coins[self.side] < reserve + producer_budget + EVASION_COST + SURPLUS_EVASION_BUFFER:
+            return []
+
+        enemy_base = info.bases[1 - self.side]
+        best: Optional[Tuple[float, int, int]] = None
+        for x in range(19):
+            for y in range(19):
+                if not is_valid_pos(x, y):
+                    continue
+                value = 0.0
+                count = 0
+                closest = 99
+                for ant in info.ants:
+                    if ant.player != self.side or not ant.is_alive():
+                        continue
+                    if distance(x, y, ant.x, ant.y) > SUPER_WEAPON_STATS[SuperWeaponType.EMERGENCY_EVASION].attack_range:
+                        continue
+                    count += 1
+                    closest = min(closest, distance(ant.x, ant.y, enemy_base.x, enemy_base.y))
+                    value += 1.0 + ant.level * 0.4 + (0.5 if ant.kind == AntKind.COMBAT else 0.0)
+                if count < 3:
+                    continue
+                value += max(0, 10 - closest) * 0.8
+                if best is None or value > best[0]:
+                    best = (value, x, y)
+        if best is None:
+            return []
+        _, x, y = best
+        op = Operation(OperationType.USE_EMERGENCY_EVASION, x, y)
+        if info.is_operation_sequence_valid(self.side, [], op):
+            self._mark_super(SuperWeaponType.EMERGENCY_EVASION)
+            return [op]
+        return []
+
+    def _try_endgame_plan(self, info: GameInfo) -> List[Operation]:
+        if info.bases[self.side].hp >= ENDGAME_HP_THRESHOLD or info.bases[1 - self.side].hp >= ENDGAME_HP_THRESHOLD:
+            return []
+        threatened = self._try_remove_threatened_producer(info)
+        if threatened:
+            return threatened
+        producer_ops = self._try_build_or_upgrade_producer(info, allow_when_storm_ready=True, reserve_override=0)
+        if producer_ops:
+            return producer_ops
+        evasion_ops = self._try_use_evasion(info)
+        if evasion_ops:
+            return evasion_ops
+        return []
+
     def _lightning_producer_plan(self, info: GameInfo) -> List[Operation]:
+        if info.bases[self.side].hp < ENDGAME_HP_THRESHOLD and info.bases[1 - self.side].hp < ENDGAME_HP_THRESHOLD:
+            return self._try_endgame_plan(info)
+
+        threatened = self._try_remove_threatened_producer(info)
+        if threatened:
+            return threatened
+
         cd = info.super_weapon_cd[self.side][int(SuperWeaponType.LIGHTNING_STORM)]
         if cd <= 0:
             if info.coins[self.side] < LIGHTNING_STORM_COST:
@@ -685,7 +928,13 @@ class AI:
             x, y = self._best_lightning_storm_point(info)
             self._mark_super(SuperWeaponType.LIGHTNING_STORM)
             return [Operation(OperationType.USE_LIGHTNING_STORM, x, y)]
-        return self._try_build_or_upgrade_producer(info)
+        producer_ops = self._try_build_or_upgrade_producer(info)
+        if producer_ops:
+            return producer_ops
+        evasion_ops = self._try_use_evasion(info)
+        if evasion_ops:
+            return evasion_ops
+        return []
 
     def _nearest_push_distance(self, info: GameInfo) -> int:
         best = 100
@@ -1434,6 +1683,7 @@ class AI:
     def __call__(self, player_id: int, game_info: GameInfo) -> List[Operation]:
         self.current_round = game_info.round
         self.side = player_id
+        self._refresh_enemy_trail_heat(game_info)
 
         return self._lightning_producer_plan(game_info)
 

@@ -624,7 +624,7 @@ def test_greedy_ai_upgrades_basic_tower_to_producer_only_when_storm_reserve_surv
 
     assert operations == [ForecastOperation(OperationType.UPGRADE_TOWER, 0, int(TowerType.PRODUCER))]
 
-    info.coins[0] = 68
+    info.coins[0] = 63
     assert GreedyAI()(0, info) == []
 
 
@@ -639,6 +639,36 @@ def test_greedy_ai_builds_during_storm_cooldown_without_spending_reserve() -> No
     assert len(operations) == 1
     assert operations[0].type == OperationType.BUILD_TOWER
     assert info.coins[0] + info.get_operation_income(0, operations[0]) == 39
+
+
+def test_greedy_ai_caps_producers_and_downgrades_threatened_producer() -> None:
+    info = ForecastState(47)
+    info.coins[0] = 500
+    info.super_weapon_cd[0][int(SuperWeaponType.LIGHTNING_STORM)] = 20
+    info.build_tower(0, 0, 6, 9, TowerType.PRODUCER)
+    info.build_tower(1, 0, 8, 7, TowerType.PRODUCER)
+
+    assert GreedyAI()(0, info) == []
+
+    info.ants.append(ForecastAnt(7, 1, 7, 9, 20, 0, 0, ForecastAntState.ALIVE))
+    assert GreedyAI()(0, info) == [ForecastOperation(OperationType.DOWNGRADE_TOWER, 0)]
+
+
+def test_greedy_ai_low_hp_endgame_does_not_spend_on_lightning() -> None:
+    info = ForecastState(48)
+    info.coins[0] = 200
+    info.bases[0].hp = 7
+    info.bases[1].hp = 8
+    info.ants.extend(
+        [
+            ForecastAnt(0, 1, 9, 9, 20, 0, 0, ForecastAntState.ALIVE),
+            ForecastAnt(1, 1, 10, 9, 20, 0, 0, ForecastAntState.ALIVE),
+        ]
+    )
+
+    operations = GreedyAI()(0, info)
+
+    assert all(op.type != OperationType.USE_LIGHTNING_STORM for op in operations)
 
 
 def test_greedy_rollout_pheromone_update_tolerates_teleported_ant_trails() -> None:
